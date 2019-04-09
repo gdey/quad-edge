@@ -20,7 +20,7 @@ func (t Triangle) IntersectsPoint(pt geometry.Point) bool {
 	}
 
 	for i := 0; i < 3; i++ {
-		switch Classify(pt, *e.Org(), *e.Dest()) {
+		switch Classify(pt, *e.Orig(), *e.Dest()) {
 
 		// return true if v is on the edge
 		case ORIGIN, DESTINATION, BETWEEN:
@@ -70,7 +70,7 @@ func (t Triangle) OppositeVertex(other Triangle) *geometry.Point {
 func (t Triangle) OppositeTriangle(p geometry.Point) (*Triangle, error) {
 	start := t.StartingEdge()
 	edge := start
-	for !geometry.ArePointsEqual(*edge.Org(), p) {
+	for !geometry.ArePointsEqual(*edge.Orig(), p) {
 		edge = edge.RNext()
 		if edge == start {
 			return nil, errors.New("invalid vertex")
@@ -100,8 +100,8 @@ func (t Triangle) SharedEdge(other Triangle) *quadedge.Edge {
 
 	for ai := 0; ai < 3; ai, ae = ai+1, ae.RNext() {
 		for bi := 0; bi < 3; bi, be = bi+1, be.RNext() {
-			if geometry.ArePointsEqual(*ae.Org(), *be.Dest()) &&
-				geometry.ArePointsEqual(*be.Org(), *ae.Dest()) {
+			if geometry.ArePointsEqual(*ae.Orig(), *be.Dest()) &&
+				geometry.ArePointsEqual(*be.Orig(), *ae.Dest()) {
 				return ae
 			}
 		}

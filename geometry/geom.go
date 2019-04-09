@@ -78,7 +78,7 @@ func InCircle(a, b, c, d Point) bool {
 }
 
 func CrossProduct(a, b Point) float64 {
-	return float64((a[0] * b[0]) - (a[1] * b[1]))
+	return float64((a[0] * b[1]) - (a[1] * b[0]))
 }
 
 func Sub(a, b Point) Point {

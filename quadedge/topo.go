@@ -1,6 +1,10 @@
 package quadedge
 
-import "github.com/gdey/quad-edge/geometry"
+import (
+	"log"
+
+	"github.com/gdey/quad-edge/geometry"
+)
 
 // Splice operator affects the two edge rings around the origin of a and b,
 // and, independently, the two edge rings around the left faces of a and b.
@@ -36,7 +40,7 @@ func Connect(a, b *Edge) *Edge {
 	e := New()
 	Splice(e, a.LNext())
 	Splice(e.Sym(), b)
-	e.EndPoints(a.Dest(), b.Org())
+	e.EndPoints(a.Dest(), b.Orig())
 	return e
 }
 
@@ -57,13 +61,14 @@ func Delete(e *Edge) {
 	if e == nil {
 		return
 	}
+	log.Printf("Deleting edge %p", e)
 	Splice(e, e.OPrev())
 	Splice(e.Sym(), e.Sym().OPrev())
 }
 
 // OnEdge determines if the point x is on the edge e.
 func OnEdge(pt geometry.Point, e *Edge) bool {
-	org := e.Org()
+	org := e.Orig()
 	if org == nil {
 		return false
 	}
@@ -77,7 +82,7 @@ func OnEdge(pt geometry.Point, e *Edge) bool {
 
 // RightOf indicates if the point is right of the Edge
 func RightOf(x geometry.Point, e *Edge) bool {
-	org := e.Org()
+	org := e.Orig()
 	if org == nil {
 		return false
 	}
@@ -88,9 +93,9 @@ func RightOf(x geometry.Point, e *Edge) bool {
 	return geometry.CCW(x, *dst, *org)
 }
 
-// LeftOf indicates if the point is right of the Edge
+// LeftOf indicates if the point is left of the Edge
 func LeftOf(x geometry.Point, e *Edge) bool {
-	org := e.Org()
+	org := e.Orig()
 	if org == nil {
 		return false
 	}

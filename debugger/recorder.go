@@ -73,7 +73,6 @@ func (rec *recorder) CloseWait() error {
 	rec.clck.Unlock()
 	log.Println("Waiting for things to finish")
 	rec.wg.Wait()
-	log.Println("Done waiting for things to finish")
 	return nil
 }
 
@@ -118,6 +117,9 @@ func (rec Recorder) Record(geom interface{}, ffl FuncFileLineType, desc TestDesc
 	return rec.recorder.Record(geom, ffl, tstDesc)
 }
 
+
+// AsyncRecord will record an entry into the debugging Database asynchronously. Zero values in the desc will be
+// replaced by their corrosponding values in the Recorder.Desc
 func (rec Recorder) AsyncRecord(geom interface{}, ffl FuncFileLineType, desc TestDescription) {
 	if !rec.IsValid() {
 		return

@@ -1,17 +1,28 @@
 package subdivision
 
 import (
+	"context"
 	"errors"
+	"fmt"
 	"log"
+	"sort"
 
+	"github.com/gdey/quad-edge/debugger"
 	"github.com/gdey/quad-edge/geometry"
 	"github.com/gdey/quad-edge/quadedge"
+	"github.com/go-spatial/geom"
+	"github.com/go-spatial/geom/cmp"
+	"github.com/go-spatial/geom/encoding/wkt"
+	"github.com/go-spatial/geom/planar"
 )
 
 var (
-	ErrCancel          = errors.New("canceled walk")
-	ErrCoincidentEdges = errors.New("coincident edges")
+	ErrCancel           = errors.New("canceled walk")
+	ErrCoincidentEdges  = errors.New("coincident edges")
+	ErrDidNotFindToFrom = errors.New("did not find to and from edge")
 )
+
+type VertexIndex map[geometry.Point]*quadedge.Edge
 
 type Subdivision struct {
 	startingEdge *quadedge.Edge
@@ -26,15 +37,38 @@ func New(a, b, c geometry.Point) *Subdivision {
 	eb := quadedge.New()
 	quadedge.Splice(ea.Sym(), eb)
 	eb.EndPoints(&b, &c)
+
 	ec := quadedge.New()
-	quadedge.Splice(eb.Sym(), ec)
 	ec.EndPoints(&c, &a)
+	quadedge.Splice(eb.Sym(), ec)
 	quadedge.Splice(ec.Sym(), ea)
 	return &Subdivision{
 		startingEdge: ea,
 		ptcount:      3,
 		frame:        [3]geometry.Point{a, b, c},
 	}
+}
+
+func NewForPoints(ctx context.Context, points [][2]float64) *Subdivision {
+	sort.Sort(cmp.ByXY(points))
+	tri := geometry.TriangleContaining(points...)
+	ttri := [3]geometry.Point{geometry.NewPoint(tri[0][0], tri[0][1]), geometry.NewPoint(tri[1][0], tri[1][1]), geometry.NewPoint(tri[2][0], tri[2][1])}
+	sd := New(ttri[0], ttri[1], ttri[2])
+	var oldPt geometry.Point
+	for i, pt := range points {
+		if ctx.Err() != nil {
+			return nil
+		}
+		bfpt := geometry.NewPoint(pt[0], pt[1])
+		if i != 0 && geometry.ArePointsEqual(oldPt, bfpt) {
+			continue
+		}
+		oldPt = bfpt
+		if !sd.InsertSite(bfpt) {
+			log.Printf("Failed to insert point %v", bfpt)
+		}
+	}
+	return sd
 }
 
 func ptEqual(x geometry.Point, a *geometry.Point) bool {
@@ -44,21 +78,106 @@ func ptEqual(x geometry.Point, a *geometry.Point) bool {
 	return geometry.ArePointsEqual(*a, x)
 }
 
-func testEdge(x geometry.Point, e *quadedge.Edge) (bool, *quadedge.Edge) {
+func testEdge(x geometry.Point, e *quadedge.Edge) (*quadedge.Edge, bool) {
 	switch {
-	case ptEqual(x, e.Org()) || ptEqual(x, e.Dest()):
-		return true, e
+	case ptEqual(x, e.Orig()) || ptEqual(x, e.Dest()):
+		return e, true
 	case quadedge.RightOf(x, e):
-		//	log.Printf("Right of e -> Sym: %p :: %p", e, e.Sym())
-		return false, e.Sym()
+		return e.Sym(), false
 	case !quadedge.RightOf(x, e.ONext()):
-		//	log.Printf("!Right of e.ONext  -> ONext: %p :: %p", e, e.ONext())
-		return false, e.ONext()
+		return e.ONext(), false
 	case !quadedge.RightOf(x, e.DPrev()):
-		//	log.Printf("!Right of e.DPrev  -> DPrev: %p :: %p", e, e.DPrev())
-		return false, e.DPrev()
+		return e.DPrev(), false
 	default:
-		return true, e
+		return e, true
+	}
+}
+
+func locate(se *quadedge.Edge, x geometry.Point, limit int) (*quadedge.Edge, bool) {
+	var (
+		e     *quadedge.Edge
+		ok    bool
+		count int
+	)
+	for e, ok = testEdge(x, se); !ok; e, ok = testEdge(x, e) {
+		if limit > 0 {
+
+			count++
+			if e == se || count > limit {
+				log.Println("searching all edges for", x)
+				e = nil
+
+				WalkAllEdges(se, func(ee *quadedge.Edge) error {
+					if _, ok = testEdge(x, ee); ok {
+						e = ee
+						return ErrCancel
+					}
+					return nil
+				})
+				log.Printf(
+					"Got back to starting edge after %v iterations, only have %v points ",
+					count,
+					limit,
+				)
+				return e, false
+			}
+		}
+	}
+	return e, true
+
+}
+
+func (sd *Subdivision) VertexIndex() VertexIndex {
+	return NewVertexIndex(sd.startingEdge)
+}
+
+// NewVertexIndex will return a new vertex index given a starting edge.
+func NewVertexIndex(startingEdge *quadedge.Edge) VertexIndex {
+	vx := make(VertexIndex)
+	WalkAllEdges(startingEdge, func(e *quadedge.Edge) error {
+		vx.Add(e)
+		return nil
+	})
+	return vx
+}
+func (vx VertexIndex) Add(e *quadedge.Edge) {
+	var (
+		ok   bool
+		orig = *e.Orig()
+		dest = *e.Dest()
+	)
+	if _, ok = vx[orig]; !ok {
+		vx[orig] = e
+	}
+	if _, ok = vx[dest]; !ok {
+		vx[dest] = e.Sym()
+	}
+}
+
+func (vx VertexIndex) Remove(e *quadedge.Edge) {
+	// Don't think I need e.Rot() and e.Rot().Sym() in this list
+	// as they are face of the quadedge.
+	toRemove := [4]*quadedge.Edge{e, e.Sym(), e.Rot(), e.Rot().Sym()}
+	shouldRemove := func(e *quadedge.Edge) bool {
+		for i := range toRemove {
+			if toRemove[i] == e {
+				return true
+			}
+		}
+		return false
+	}
+
+	for _, v := range [...]geometry.Point{*e.Orig(), *e.Dest()} {
+		ve := vx[v]
+		if ve == nil || !shouldRemove(ve) {
+			continue
+		}
+		delete(vx, v)
+		// See if the ccw edge is the same as us, if it's isn't
+		// then use that as the edge for our lookup.
+		if ve != ve.ONext() {
+			vx[v] = ve.ONext()
+		}
 	}
 }
 
@@ -67,54 +186,14 @@ func testEdge(x geometry.Point, e *quadedge.Edge) (bool, *quadedge.Edge) {
 // and proceeds in the general direction of x. Based on the
 // pseudocode in Guibas and Stolfi (1985) p.121
 func (sd *Subdivision) locate(x geometry.Point) (*quadedge.Edge, bool) {
-	var (
-		e     *quadedge.Edge
-		ok    bool
-		count int
-	)
-	for ok, e = testEdge(x, sd.startingEdge); !ok; ok, e = testEdge(x, e) {
-
-		count++
-		if e == sd.startingEdge || count > sd.ptcount*2 {
-			log.Println("searching all edges for", x)
-			e = nil
-
-			WalkAllEdges(sd.startingEdge, func(ee *quadedge.Edge) error {
-				if ok, _ = testEdge(x, ee); ok {
-					log.Printf("Found the edge %p", ee)
-					e = ee
-					return ErrCancel
-				}
-				return nil
-			})
-			log.Printf(
-				"Got back to starting edge after %v iterations, only have %v points ",
-				count,
-				sd.ptcount,
-			)
-			return e, false
-		}
-	}
-	return e, true
+	return locate(sd.startingEdge, x, sd.ptcount*2)
 }
 
-func (sd *Subdivision) locateSegment(startingEdge *quadedge.Edge, end geometry.Point) *quadedge.Edge {
-	if startingEdge == nil {
-		return nil
+func (sd *Subdivision) FindEdge(vertexIndex VertexIndex, start, end geometry.Point) *quadedge.Edge {
+	if vertexIndex == nil {
+		vertexIndex = sd.VertexIndex()
 	}
-	curr := startingEdge
-	for backToStart := false; !backToStart; backToStart = curr == startingEdge {
-		if geometry.ArePointsEqual(end, *curr.Dest()) {
-			return curr
-		}
-		curr = curr.ONext()
-	}
-	// Did not find and edge with vertex start, end
-	return nil
-}
-func (sd *Subdivision) LocateSegment(start, end geometry.Point) *quadedge.Edge {
-	startingEdge, _ := sd.locate(start)
-	return sd.locateSegment(startingEdge, end)
+	return vertexIndex[start].FindONextDest(end)
 }
 
 // InsertSite will insert a new point into a subdivision representing a Delaunay
@@ -128,19 +207,26 @@ func (sd *Subdivision) InsertSite(x geometry.Point) bool {
 		// Did not find the edge using normal walk
 		return false
 	}
-	if ptEqual(x, e.Org()) || ptEqual(x, e.Dest()) {
+
+	if ptEqual(x, e.Orig()) || ptEqual(x, e.Dest()) {
 		// Point is already in subdivision
 		return true
 	}
+
 	if quadedge.OnEdge(x, e) {
 		e = e.OPrev()
+		// Check to see if this point is still alreayd there.
+		if ptEqual(x, e.Orig()) || ptEqual(x, e.Dest()) {
+			// Point is already in subdivision
+			return true
+		}
 		quadedge.Delete(e.ONext())
 	}
 
 	// Connect the new point to the vertices of the containing
 	// triangle (or quadrilaterial, if the new point fell on an
 	// existing edge.)
-	base := quadedge.NewWithEndPoints(e.Org(), &x)
+	base := quadedge.NewWithEndPoints(e.Orig(), &x)
 	quadedge.Splice(base, e)
 	sd.startingEdge = base
 
@@ -157,7 +243,7 @@ func (sd *Subdivision) InsertSite(x geometry.Point) bool {
 		t := e.OPrev()
 		switch {
 		case quadedge.RightOf(*t.Dest(), e) &&
-			geometry.InCircle(*e.Org(), *t.Dest(), *e.Dest(), x):
+			geometry.InCircle(*e.Orig(), *t.Dest(), *e.Dest(), x):
 			quadedge.Swap(e)
 			e = e.OPrev()
 
@@ -170,23 +256,44 @@ func (sd *Subdivision) InsertSite(x geometry.Point) bool {
 	return true
 }
 
-func (sd *Subdivision) InsertConstaint(start, end geometry.Point) error {
+func (sd *Subdivision) InsertConstraint(ctx context.Context, vertexIndex VertexIndex, start, end geometry.Point) (err error) {
+
+	if debug {
+
+		ctx = debugger.AugmentContext(ctx, "")
+		defer debugger.Close(ctx)
+
+	}
+	defer func() {
+		if err != nil && err != ErrCoincidentEdges {
+			//DumpSubdivision(sd)
+			fmt.Printf("starting point %#v\n", start)
+			fmt.Printf("end point %#v\n", end)
+		}
+	}()
+
 	var (
 		pu []geometry.Point
 		pl []geometry.Point
 	)
 
-	startingEdge, _ := sd.locate(start)
-	if startingEdge == nil {
-		// start is not in our subdivision
-		return errors.New("Invlid starting vertex.")
+	if vertexIndex == nil {
+		vertexIndex = sd.VertexIndex()
 	}
-	if e := sd.locateSegment(startingEdge, end); e != nil {
+
+	startingEdge, ok := vertexIndex[start]
+	if !ok {
+		// start is not in our subdivision
+		return errors.New("Invalid starting vertex.")
+	}
+
+	if e := startingEdge.FindONextDest(end); e != nil {
 		// Nothing to do, edge already in the subdivision.
 		return nil
 	}
-	removalList, err := IntersectingEdges(startingEdge, end)
-	if err != nil {
+
+	removalList, err := IntersectingEdges(ctx, startingEdge, end)
+	if err != nil && err != ErrCoincidentEdges {
 		return err
 	}
 
@@ -197,17 +304,24 @@ func (sd *Subdivision) InsertConstaint(start, end geometry.Point) error {
 		if IsHardFrameEdge(sd.frame, e) {
 			continue
 		}
-		for _, spoint := range [2]geometry.Point{*e.Org(), *e.Dest()} {
-			switch Classify(spoint, start, end) {
+		for _, spoint := range [2]geometry.Point{*e.Orig(), *e.Dest()} {
+			switch c := Classify(spoint, start, end); c {
 			case LEFT:
 				pl = geometry.AppendNonRepeat(pl, spoint)
 			case RIGHT:
 				pu = geometry.AppendNonRepeat(pu, spoint)
 			default:
-				// should not come here.
-
+				/*
+					if debug {
+						log.Printf("Classification: %v -- %v, %v, %v",c,spoint, start,end)
+						// should not come here.
+						return ErrAssumptionFailed()
+					}
+				*/
+				continue
 			}
 		}
+		vertexIndex.Remove(e)
 		quadedge.Delete(e)
 	}
 
@@ -222,64 +336,264 @@ func (sd *Subdivision) InsertConstaint(start, end geometry.Point) error {
 
 		edges, err := triangulatePseudoPolygon(pts)
 		if err != nil {
+			log.Println("triangulate pseudo polygon fail.")
 			return err
 		}
 
-		for _, edge := range edges {
+		var redoedges []int
+		for i, edge := range edges {
 
 			// First we need to check that the edge does not intersect other edges, this can happen if
-			// the polygon we were wer triangulating happens to be concave. In which case it is possible
+			// the polygon we are  triangulating happens to be concave. In which case it is possible
 			// a triangle outside of the "ok" region, and we should ignore those edges
 
 			// Original code think this is a bug: intersectList, _ := intersectingEdges(startingEdge,end)
 			{
-				startingEdge, _ := sd.locate(edge[0])
-				intersectList, _ := IntersectingEdges(startingEdge, edge[1])
-				if len(intersectList) > 0 {
+				/*
+					startingEdge := vertexIndex[edge[0]]
+
+					//intersectList, err := IntersectingEdges(ctx, startingEdge, edge[1])
+					intersectList, err := IntersectingEdges(ctx, startingEdge, end)
+					if err != nil && err != ErrCoincidentEdges {
+						log.Println("failed to insert edge check")
+						return err
+					}
+					// filter out intersects only at the end points.
+					count := 0
+					for _, iln := range intersectList {
+						if geometry.ArePointsEqual(*iln.Orig(), edge[0]) ||
+							geometry.ArePointsEqual(*iln.Dest(), edge[0]) ||
+							geometry.ArePointsEqual(*iln.Orig(), edge[1]) ||
+							geometry.ArePointsEqual(*iln.Dest(), edge[1]) {
+							continue
+						}
+						count++
+					}
+					if count > 0 {
+						if debug {
+							debugger.Record(ctx,
+								geometry.UnwrapPoint(edge[0]),
+								"intersecting line:startPoint",
+								"Start Point",
+							)
+							debugger.Record(ctx,
+								geometry.UnwrapPoint(edge[1]),
+								"intersecting line:endPoint",
+								"End Point",
+							)
+							debugger.Record(ctx,
+								startingEdge.AsGeomLine(),
+								"intersecting line:startingedge",
+								"StartingEdge %v", startingEdge.AsGeomLine(),
+							)
+							l := geom.Line{geometry.UnwrapPoint(*startingEdge.Orig()), geometry.UnwrapPoint(edge[1])}
+							debugger.Record(ctx,
+								l,
+								"intersecting line:intersecting",
+								"should not fine any intersects with this line. %v ", l,
+							)
+							for i, il := range intersectList {
+								debugger.Record(ctx,
+									il.AsGeomLine(),
+									"intersecting line:intersected",
+									"line %v of %v -- %v", i, len(intersectList), il.AsGeomLine(),
+								)
+							}
+
+						}
+						log.Println("number of intersectlist found", count)
+						//return errors.New("Should not get here.")
+						continue
+					}
+				*/
+			}
+
+			if err = sd.insertEdge(vertexIndex, edge[0], edge[1]); err != nil {
+				if err == ErrDidNotFindToFrom {
+					// let's reque this edge
+					redoedges = append(redoedges, i)
 					continue
 				}
-			}
-
-			if err = sd.insertEdge(edge[0], edge[1]); err != nil {
+				log.Println("Failed to insert edge.")
 				return err
 			}
+		}
+		for _, i := range redoedges {
+			if err = sd.insertEdge(vertexIndex, edges[i][0], edges[i][1]); err != nil {
+				log.Println("Redo Failed to insert edge.", len(redoedges))
 
+				//ignore
+				//	return err
+			}
 		}
 	}
 
 	return nil
 }
 
-func (sd *Subdivision) insertEdge(start, end geometry.Point) error {
-	edge, _ := sd.locate(start)
-	if edge == nil {
-		// start is not in our subdivision
-		return errors.New("Invlid starting vertex.")
+func selectCorrectEdges(from, to *quadedge.Edge) (cfrom, cto *quadedge.Edge) {
+	orig := *from.Orig()
+	dest := *to.Orig()
+	cfrom, cto = from, to
+	log.Printf("curr RightOf(dest)? %v", quadedge.RightOf(dest, cfrom))
+	log.Printf("destedge.Sym RightOf(orig)? %v", quadedge.RightOf(orig, cto))
+	if !quadedge.RightOf(dest, cfrom) {
+		cfrom = cfrom.OPrev()
 	}
-	if e := sd.locateSegment(edge, end); e != nil {
-		// Nothing to do, edge already in the subdivision.
+	if !quadedge.RightOf(orig, cto) {
+		cto = cto.OPrev()
+	}
+	return cfrom, cto
+}
+
+func resolveEdge(gse *quadedge.Edge, dest geometry.Point) *quadedge.Edge {
+
+	// There aren't any other edges on this vertex.
+	if gse == gse.ONext() {
+		return gse
+	}
+
+	var lre *quadedge.Edge
+	se := gse
+	curr := se
+	for {
+		if quadedge.RightOf(dest, curr) {
+			if lre == nil {
+				// reset our starting edge.
+				se = curr
+			}
+			lre = curr
+			curr = curr.ONext()
+			if curr == se {
+				break
+			}
+			continue
+		}
+		// not right of
+		if lre == nil {
+			// We have not spotted an element right of us
+			curr = curr.ONext()
+			if curr == se {
+				break
+			}
+			continue
+		}
+		return lre
+	}
+	if lre != nil {
+		return lre
+	}
+	return se
+}
+
+func findImmediateRightOfEdges(se *quadedge.Edge, dest geometry.Point) (*quadedge.Edge, *quadedge.Edge) {
+
+
+
+	// We want the edge immediately left of the dest.
+
+	orig := *se.Orig()
+	log.Printf("Looking for orig fo %v to dest of %v", orig, dest)
+	curr := se
+	for {
+		log.Printf("top level looking at: %p (%v -> %v)", curr, *curr.Orig(), *curr.Dest())
+		if geometry.ArePointsEqual(*curr.Dest(), dest) {
+			// edge already in the system.
+			log.Printf("Edge already in system: %p", curr)
+			return curr, nil
+
+		}
+
+		// Need to see if the dest Next has the dest.
+		for destedge := curr.Sym().ONext(); destedge != curr.Sym(); destedge = destedge.ONext() {
+			log.Printf("\t looking at: %p (%v -> %v)", destedge, *destedge.Orig(), *destedge.Dest())
+			if geometry.ArePointsEqual(*destedge.Dest(), dest) {
+				// found what we are looking for.
+				log.Printf("Found the dest! %v -- %p %p", dest, curr, destedge.Sym())
+
+				return selectCorrectEdges(curr, destedge.Sym())
+			}
+			//log.Println("Next:", *destedge.Orig(), *curr.Sym().Orig(), *curr.Sym().Dest())
+
+		}
+		curr = curr.ONext()
+		if curr == se {
+			break
+		}
+	}
+	return nil, nil
+}
+
+func (sd *Subdivision) insertEdge(vertexIndex VertexIndex, start, end geometry.Point) error {
+	if vertexIndex == nil {
+		vertexIndex = sd.VertexIndex()
+	}
+	startingedge, ok := vertexIndex[start]
+	if !ok {
+		// start is not in our subdivision
+		return errors.New("Invalid starting vertex.")
+	}
+
+	from  := resolveEdge(startingedge,end) 
+	// need to check to see if the dest of from.ONext() is the same as end
+	if geometry.ArePointsEqual(*from.ONext().Dest(), end) {
+		// already in the system.
 		return nil
 	}
-	// Only Error it gives is ErrCoincidentEdges, and we are fine with those.
-	ct, _ := FindIntersectingTriangle(edge, end)
-	if ct == nil {
-		return errors.New("did not find an intersecting trinagle. assumptions broken.")
+	startingedge, ok = vertexIndex[end]
+	if !ok {
+		// end is not in our subdivision
+		return errors.New("Invalid end vertex.")
 	}
 
-	from := ct.StartingEdge().Sym()
+	to := resolveEdge(startingedge, start)
 
-	symEdge, _ := sd.locate(end)
-	if symEdge == nil {
-		return errors.New("Invlid ending vertex.")
+
+
+	/*
+	log.Println("Looking for to and from.")
+	// Now let's find the edge that would be ccw to end
+	from, to := findImmediateRightOfEdges(startingedge.ONext(), end)
+	log.Printf("found for to and from? %p, %p", from, to)
+	if from == nil {
+		// The nodes are too far away or the line we are trying to
+		// insert crosses and already existing line
+		return ErrDidNotFindToFrom
+	}
+	if to == nil {
+		// already in the system
+		return nil
 	}
 
-	ct, _ = FindIntersectingTriangle(symEdge, start)
-	if ct == nil {
-		return errors.New("did not find an intersecting trinagle. assumptions broken.")
-	}
 
-	to := ct.StartingEdge().OPrev()
-	_ = quadedge.Connect(from, to)
+		ct, err := FindIntersectingTriangle(edge, end)
+		if err != nil && err != ErrCoincidentEdges {
+			return err
+		}
+		if ct == nil {
+			return errors.New("did not find an intersecting triangle. assumptions broken.")
+		}
+
+		from := ct.StartingEdge().Sym()
+
+		symEdge, ok := vertexIndex[end]
+		if !ok || symEdge == nil {
+			return errors.New("Invalid ending vertex.")
+		}
+
+		ct, err = FindIntersectingTriangle(symEdge, start)
+		if err != nil && err != ErrCoincidentEdges {
+			return err
+		}
+		if ct == nil {
+			return errors.New("sym did not find an intersecting triangle. assumptions broken.")
+		}
+
+		to := ct.StartingEdge().OPrev()
+	*/
+	newEdge := quadedge.Connect(from, to)
+	log.Printf("Added edge %p", newEdge)
+	vertexIndex.Add(newEdge)
 	return nil
 }
 
@@ -300,10 +614,22 @@ func (sd *Subdivision) Triangles(includeFrame bool) (triangles [][3]geometry.Poi
 		sd.startingEdge,
 		func(edges []*quadedge.Edge) error {
 			if len(edges) != 3 {
-				return errors.New("Something Strange!")
+				// skip this edge
+				for i, e := range edges {
+					log.Printf("got the following edge%v : %v", i,
+						wkt.MustEncode(
+							geom.Line{
+								geometry.UnwrapPoint(*e.Orig()),
+								geometry.UnwrapPoint(*e.Dest()),
+							},
+						),
+					)
+				}
+				return nil
+				//	return errors.New("Something Strange!")
 			}
 
-			pts := [3]geometry.Point{*edges[0].Org(), *edges[1].Org(), *edges[2].Org()}
+			pts := [3]geometry.Point{*edges[0].Orig(), *edges[1].Orig(), *edges[2].Orig()}
 
 			// Do we want to skip because the points are part of the frame and
 			// we have been requested not to include triangles attached to the frame.
@@ -354,7 +680,7 @@ func WalkAllEdges(se *quadedge.Edge, fn func(e *quadedge.Edge) error) error {
 // IsFrameEdge indicates if the edge is part of the given frame.
 func IsFrameEdge(frame [3]geometry.Point, es ...*quadedge.Edge) bool {
 	for _, e := range es {
-		o, d := *e.Org(), *e.Dest()
+		o, d := *e.Orig(), *e.Dest()
 		of := geometry.ArePointsEqual(o, frame[0]) || geometry.ArePointsEqual(o, frame[1]) || geometry.ArePointsEqual(o, frame[2])
 		df := geometry.ArePointsEqual(d, frame[0]) || geometry.ArePointsEqual(d, frame[1]) || geometry.ArePointsEqual(d, frame[2])
 		if of || df {
@@ -366,7 +692,7 @@ func IsFrameEdge(frame [3]geometry.Point, es ...*quadedge.Edge) bool {
 
 // IsFrameEdge indicates if the edge is part of the given frame where both vertexs are part of the frame.
 func IsHardFrameEdge(frame [3]geometry.Point, e *quadedge.Edge) bool {
-	o, d := *e.Org(), *e.Dest()
+	o, d := *e.Orig(), *e.Dest()
 	of := geometry.ArePointsEqual(o, frame[0]) || geometry.ArePointsEqual(o, frame[1]) || geometry.ArePointsEqual(o, frame[2])
 	df := geometry.ArePointsEqual(d, frame[0]) || geometry.ArePointsEqual(d, frame[1]) || geometry.ArePointsEqual(d, frame[2])
 	return of && df
@@ -445,7 +771,6 @@ func WalkAllTriangleEdges(se *quadedge.Edge, fn func(edges []*quadedge.Edge) err
 
 func FindIntersectingTriangle(startingEdge *quadedge.Edge, end geometry.Point) (*Triangle, error) {
 	var (
-		//start = startingEdge.Org()
 		left  = startingEdge
 		right *quadedge.Edge
 	)
@@ -453,8 +778,8 @@ func FindIntersectingTriangle(startingEdge *quadedge.Edge, end geometry.Point) (
 	for {
 		right = left.OPrev()
 
-		lc := Classify(end, *left.Org(), *left.Dest())
-		rc := Classify(end, *right.Org(), *right.Dest())
+		lc := Classify(end, *left.Orig(), *left.Dest())
+		rc := Classify(end, *right.Orig(), *right.Dest())
 
 		if (lc == RIGHT && rc == LEFT) ||
 			lc == BETWEEN ||
@@ -463,7 +788,8 @@ func FindIntersectingTriangle(startingEdge *quadedge.Edge, end geometry.Point) (
 			return &Triangle{left}, nil
 		}
 
-		if lc != RIGHT && lc != LEFT && rc != RIGHT && rc != LEFT {
+		if lc != RIGHT && lc != LEFT &&
+			rc != RIGHT && rc != LEFT {
 			return &Triangle{left}, ErrCoincidentEdges
 		}
 		left = right
@@ -476,24 +802,55 @@ func FindIntersectingTriangle(startingEdge *quadedge.Edge, end geometry.Point) (
 	return nil, nil
 }
 
-func IntersectingEdges(startingEdge *quadedge.Edge, end geometry.Point) (intersected []*quadedge.Edge, err error) {
+func IntersectingEdges(ctx context.Context, startingEdge *quadedge.Edge, end geometry.Point) (intersected []*quadedge.Edge, err error) {
+
+	if debug {
+
+		ctx = debugger.AugmentContext(ctx, "")
+		defer debugger.Close(ctx)
+
+	}
 
 	var (
-		start        = startingEdge.Org()
+		start        = startingEdge.Orig()
 		tseq         *Triangle
 		pseq         geometry.Point
 		shared       *quadedge.Edge
 		currentPoint = start
 	)
 
+	line := geom.Line{geometry.UnwrapPoint(*start), geometry.UnwrapPoint(end)}
+
 	t, err := FindIntersectingTriangle(startingEdge, end)
 	if err != nil {
 		return nil, err
 	}
+	if debug {
+		log.Println("First Triangle: ", t.AsGeom())
+		debugger.Record(ctx,
+			t.AsGeom(),
+			"FindIntersectingEdges:Triangle:0",
+			"First triangle.",
+		)
+	}
 
 	for !t.IntersectsPoint(end) {
 		if tseq, err = t.OppositeTriangle(*currentPoint); err != nil {
+			if debug {
+				debugger.Record(ctx,
+					tseq.AsGeom(),
+					"FindIntersectingEdges:Triangle:Opposite",
+					"Opposite triangle.",
+				)
+			}
 			return nil, err
+		}
+		if debug {
+			debugger.Record(ctx,
+				tseq.AsGeom(),
+				"FindIntersectingEdges:Triangle:Opposite",
+				"Opposite triangle.",
+			)
 		}
 		shared = t.SharedEdge(*tseq)
 		if shared == nil {
@@ -503,13 +860,42 @@ func IntersectingEdges(startingEdge *quadedge.Edge, end geometry.Point) (interse
 		pseq = *tseq.OppositeVertex(*t)
 		switch Classify(pseq, *start, end) {
 		case LEFT:
-			currentPoint = shared.Org()
+			currentPoint = shared.Orig()
 		case RIGHT:
 			currentPoint = shared.Dest()
 		}
-		intersected = append(intersected, shared)
+		if _, ok := planar.SegmentIntersect(line, *shared.AsGeomLine()); ok {
+			intersected = append(intersected, shared)
+		}
 		t = tseq
 	}
 	return intersected, nil
 
+}
+
+func (sd *Subdivision) IsValid(ctx context.Context) bool {
+	count := 0
+	if debug {
+
+		ctx = debugger.AugmentContext(ctx, "")
+		defer debugger.Close(ctx)
+
+	}
+	_ = sd.WalkAllEdges(func(e *quadedge.Edge) error {
+		l := e.AsGeomLine()
+		l2 := l.LenghtSquared()
+		if l2 == 0 {
+			count++
+			if debug {
+				debugger.Record(ctx,
+					l,
+					"ZeroLenght:Edge",
+					"Line (%p) %v -- %v ", e, l2, l,
+				)
+			}
+		}
+		return nil
+	})
+	log.Println("Count", count)
+	return count == 0
 }

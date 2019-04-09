@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"unicode"
 
 	"github.com/gdey/quad-edge/debugger/spatialite"
 	"github.com/pborman/uuid"
@@ -61,6 +62,30 @@ var recrds = make(map[string]struct {
 	rcrd *recorder
 })
 
+func cleanupFilename(fn string) string {
+	const replaceValues = ` []{}"'^%*&\,;?!()`
+	var nfn strings.Builder
+	for _, r := range strings.TrimSpace(strings.ToLower(fn)) {
+		switch {
+		case !unicode.IsPrint(r) || unicode.IsSpace(r):
+			// no opt
+		case strings.ContainsRune(replaceValues, r):
+			nfn.WriteRune('_')
+		default:
+			nfn.WriteRune(r)
+		}
+	}
+	return nfn.String()
+}
+func getFilenameDir(initialFilename string) (dir, filename string) {
+
+	initialFilename = cleanupFilename(initialFilename)
+	fullFilename := filepath.Clean(filepath.Join(DefaultOutputDir, initialFilename))
+	dir = filepath.Dir(fullFilename)
+	filename = filepath.Base(fullFilename)
+	return dir, filename
+}
+
 // AugmentRecorder is will create and configure a new recorder (if needed) to
 // be used to track the debugging entries
 // A Close call on the recoder should be supplied along with the
@@ -68,27 +93,29 @@ var recrds = make(map[string]struct {
 // If the testFilename is "", then the function name of the calling function
 // will be used as the filename for the database file.
 func AugmentRecorder(rec Recorder, testFilename string) (Recorder, bool) {
+
 	if rec.IsValid() {
 		rec.IncrementCount()
 		return rec, false
 	}
+
 	if testFilename == "" {
 		testFilename = funcFileLine().Func
 	}
-	outputDir := filepath.Dir(filepath.Join(DefaultOutputDir, testFilename))
+	dir, filename := getFilenameDir(testFilename)
 
-	err := os.MkdirAll(outputDir, os.ModePerm)
+	err := os.MkdirAll(dir, os.ModePerm)
 	if err != nil {
-		panic(fmt.Sprintf("Failed to created dir %v:%v", outputDir, err))
+		panic(fmt.Sprintf("Failed to created dir %v:%v", dir, err))
 	}
 
 	lck.Lock()
 	defer lck.Unlock()
 	rcrd, ok := recrds[testFilename]
 	if !ok {
-		rcd, filename, err := spatialite.New(outputDir, testFilename)
+		rcd, filename, err := spatialite.New(dir, filename)
 		if err != nil {
-			panic(fmt.Sprintf("Failed to created spatialite db (%v): %v", testFilename, err))
+			panic(fmt.Sprintf("Failed to created spatialite db (%v): %v", filepath.Join(dir, filename), err))
 			os.Exit(1)
 		}
 		rcrd = struct {
@@ -100,9 +127,8 @@ func AugmentRecorder(rec Recorder, testFilename string) (Recorder, bool) {
 		}
 		recrds[testFilename] = rcrd
 
-	} else {
-		rcrd.rcrd.IncrementCount()
 	}
+	rcrd.rcrd.IncrementCount()
 	log.Println("Writing debugger output to", rcrd.fn)
 
 	return Recorder{
@@ -124,6 +150,7 @@ func AugmentContext(ctx context.Context, testFilename string) context.Context {
 	if testFilename == "" {
 		testFilename = funcFileLine().Func
 	}
+
 	if rec, newRec := AugmentRecorder(GetRecorderFromContext(ctx), testFilename); newRec {
 		return context.WithValue(ctx, ContextRecorderKey, rec)
 	}
@@ -165,7 +192,7 @@ func RecordFFLOn(rec Recorder, ffl FuncFileLineType, geom interface{}, category 
 	}
 	description := fmt.Sprintf(descriptionFormat, data...)
 
-	rec.AsyncRecord(
+	rec.Record(
 		geom,
 		ffl,
 		TestDescription{

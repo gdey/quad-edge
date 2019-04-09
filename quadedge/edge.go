@@ -34,7 +34,7 @@ func (e *Edge) QEdge() *QuadEdge {
 	return e.qe
 }
 
-func (e *Edge) Org() *geometry.Point {
+func (e *Edge) Orig() *geometry.Point {
 	if e == nil {
 		return nil
 	}
@@ -42,7 +42,7 @@ func (e *Edge) Org() *geometry.Point {
 }
 
 func (e *Edge) Dest() *geometry.Point {
-	return e.Sym().Org()
+	return e.Sym().Orig()
 }
 
 func (e *Edge) EndPoints(org, dest *geometry.Point) {
@@ -128,4 +128,25 @@ func (e *Edge) RNext() *Edge {
 // RPrev returns the edge around the right face ccw before the current edge.
 func (e *Edge) RPrev() *Edge {
 	return e.Sym().ONext()
+}
+
+/*****************************************************************************/
+/*         Convenience functions to find edges                                 */
+/*****************************************************************************/
+
+// FindONextDest will look for and return a ccw edge the given dest point, if it
+// exists.
+func (e *Edge) FindONextDest(dest geometry.Point) *Edge {
+	if e == nil {
+		return nil
+	}
+	if geometry.ArePointsEqual(dest, *e.Dest()) {
+		return e
+	}
+	for ne := e.ONext(); ne != e; ne = ne.ONext() {
+		if geometry.ArePointsEqual(dest, *ne.Dest()) {
+			return ne
+		}
+	}
+	return nil
 }
